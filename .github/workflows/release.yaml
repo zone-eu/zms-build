@@ -3,8 +3,21 @@ name: Build and Release (Matrix)
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "**"
   workflow_dispatch:
+    inputs:
+      wildduck_version:
+        description: "Wildduck version (leave empty for latest)"
+        required: false
+        type: string
+      zonemta_version:
+        description: "Zone-MTA version (leave empty for latest)"
+        required: false
+        type: string
+      haraka_version:
+        description: "Haraka version (leave empty for latest)"
+        required: false
+        type: string
 
 jobs:
   build:
@@ -26,25 +39,44 @@ jobs:
       - name: Checkout workflow repo
         uses: actions/checkout@v6
 
-      - name: Get latest release tag for ${{ matrix.project.name }}
-        id: get_latest_release
+      - name: Get version for ${{ matrix.project.name }}
+        id: get_version
         run: |
-          LATEST_TAG=$(curl -s https://api.github.com/repos/${{ matrix.project.repo }}/releases/latest \
-          | jq -r '.tag_name')
+          # Check if explicit version is provided via workflow input
+          case "${{ matrix.project.name }}" in
+            wildduck)
+              EXPLICIT_VERSION="${{ inputs.wildduck_version }}"
+              ;;
+            zone-mta)
+              EXPLICIT_VERSION="${{ inputs.zonemta_version }}"
+              ;;
+            haraka)
+              EXPLICIT_VERSION="${{ inputs.haraka_version }}"
+              ;;
+          esac
 
-          if [ -z "$LATEST_TAG" ]; then
-            echo "No release tags found, falling back to master"
-            LATEST_TAG="${{ matrix.project.ref }}"
+          if [ -n "$EXPLICIT_VERSION" ]; then
+            echo "Using explicit version: $EXPLICIT_VERSION"
+            echo "tag=$EXPLICIT_VERSION" >> $GITHUB_OUTPUT
+          else
+            # Fetch latest release
+            LATEST_TAG=$(curl -s https://api.github.com/repos/${{ matrix.project.repo }}/releases/latest \
+              | jq -r '.tag_name')
+            
+            if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+              echo "No release tags found, falling back to master"
+              LATEST_TAG="${{ matrix.project.ref }}"
+            fi
+            
+            echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            echo "Using tag/ref: $LATEST_TAG for ${{ matrix.project.name }}"
           fi
-
-          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-          echo "Using tag/ref: $LATEST_TAG for ${{ matrix.project.name }}"
 
       - name: Checkout ${{ matrix.project.name }}
         uses: actions/checkout@v6
         with:
           repository: ${{ matrix.project.repo }}
-          ref: ${{ steps.get_latest_release.outputs.tag }}
+          ref: ${{ steps.get_version.outputs.tag }}
           path: ${{ matrix.project.name }}
 
       - name: Setup Node.js
@@ -74,7 +106,7 @@ jobs:
               plugin=$(echo "$plugin" | xargs)
               
               echo "Installing: $plugin"
-              if npm install "$plugin"; then
+              if npm install --save-exact "$plugin"; then
                plugin_count=$((plugin_count + 1))
                echo "✓ Successfully installed $plugin"
               else
@@ -92,16 +124,16 @@ jobs:
       - name: Create archives
         run: |
           cd ${{ matrix.project.name }}
-          zip -q -r ../${{ matrix.project.name }}-${{ steps.get_latest_release.outputs.tag }}.zip .
-          tar -czf ../${{ matrix.project.name }}-${{ steps.get_latest_release.outputs.tag }}.tar.gz .
+          zip -q -r ../${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.zip . -x "*.git" "*.git/*"
+          tar --exclude='.git' --exclude='.git/*' -czf ../${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.tar.gz .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.project.name }}-build
           path: |
-            ${{ matrix.project.name }}-${{ steps.get_latest_release.outputs.tag }}.zip
-            ${{ matrix.project.name }}-${{ steps.get_latest_release.outputs.tag }}.tar.gz
+            ${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.zip
+            ${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.tar.gz
 
   create-release:
     needs: build
