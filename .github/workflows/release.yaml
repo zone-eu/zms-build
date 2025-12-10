@@ -230,7 +230,7 @@ jobs:
             artifacts/*/*.tar.gz
           draft: false
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: false
           body: |
             ## Mail Server Stack Build
 
