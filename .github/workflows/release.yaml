@@ -1,0 +1,166 @@
+name: Build and Release (Matrix)
+
+on:
+  push:
+    tags:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      wildduck_version:
+        description: "Wildduck version (leave empty for latest)"
+        required: false
+        type: string
+      zonemta_version:
+        description: "Zone-MTA version (leave empty for latest)"
+        required: false
+        type: string
+      haraka_version:
+        description: "Haraka version (leave empty for latest)"
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        project:
+          - name: wildduck
+            repo: zone-eu/wildduck
+            ref: master
+          - name: zone-mta
+            repo: zone-eu/zone-mta
+            ref: master
+          - name: haraka
+            repo: haraka/Haraka
+            ref: master
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v6
+
+      - name: Get version for ${{ matrix.project.name }}
+        id: get_version
+        run: |
+          # Check if explicit version is provided via workflow input
+          case "${{ matrix.project.name }}" in
+            wildduck)
+              EXPLICIT_VERSION="${{ inputs.wildduck_version }}"
+              ;;
+            zone-mta)
+              EXPLICIT_VERSION="${{ inputs.zonemta_version }}"
+              ;;
+            haraka)
+              EXPLICIT_VERSION="${{ inputs.haraka_version }}"
+              ;;
+          esac
+
+          if [ -n "$EXPLICIT_VERSION" ]; then
+            echo "Using explicit version: $EXPLICIT_VERSION"
+            echo "tag=$EXPLICIT_VERSION" >> $GITHUB_OUTPUT
+          else
+            # Fetch latest release
+            LATEST_TAG=$(curl -s https://api.github.com/repos/${{ matrix.project.repo }}/releases/latest \
+              | jq -r '.tag_name')
+            
+            if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+              echo "No release tags found, falling back to master"
+              LATEST_TAG="${{ matrix.project.ref }}"
+            fi
+            
+            echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            echo "Using tag/ref: $LATEST_TAG for ${{ matrix.project.name }}"
+          fi
+
+      - name: Checkout ${{ matrix.project.name }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ matrix.project.repo }}
+          ref: ${{ steps.get_version.outputs.tag }}
+          path: ${{ matrix.project.name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm i --omit=dev
+        working-directory: ${{ matrix.project.name }}
+
+      - name: Install plugins for ${{ matrix.project.name }}
+        run: |
+          PLUGIN_FILE="${GITHUB_WORKSPACE}/plugins/${{ matrix.project.name }}.txt"
+
+          if [ -f "$PLUGIN_FILE" ]; then
+          echo "📦 Installing plugins for ${{ matrix.project.name }}..."
+          plugin_count=0
+
+          while IFS= read -r plugin || [ -n "$plugin" ]; do
+              # Skip empty lines and comments
+              if [ -z "$plugin" ] || [[ "$plugin" =~ ^#.* ]]; then
+               continue
+              fi
+              
+              # Trim whitespace
+              plugin=$(echo "$plugin" | xargs)
+              
+              echo "Installing: $plugin"
+              if npm install --save-exact "$plugin"; then
+               plugin_count=$((plugin_count + 1))
+               echo "✓ Successfully installed $plugin"
+              else
+               echo "✗ Failed to install $plugin"
+               exit 1
+              fi
+          done < "$PLUGIN_FILE"
+
+          echo "✅ Installed $plugin_count plugins successfully"
+          else
+          echo "❌ No plugin file found, skipping plugin installation"
+          fi
+        working-directory: ${{ matrix.project.name }}
+
+      - name: Create archives
+        run: |
+          cd ${{ matrix.project.name }}
+          zip -q -r ../${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.zip . -x "*.git" "*.git/*"
+          tar --exclude='.git' --exclude='.git/*' -czf ../${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.project.name }}-build
+          path: |
+            ${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.zip
+            ${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.tar.gz
+
+  create-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*/*.zip
+            artifacts/*/*.tar.gz
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## Mail Server Stack Build
+
+            This release includes:
+            - Wildduck
+            - Zone-MTA
+            - Haraka
+
+            All projects built with production-ready plugins added.
