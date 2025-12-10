@@ -23,11 +23,28 @@ jobs:
             ref: master
 
     steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v6
+
+      - name: Get latest release tag for ${{ matrix.project.name }}
+        id: get_latest_release
+        run: |
+          LATEST_TAG=$(curl -s https://api.github.com/repos/${{ matrix.project.repo }}/releases/latest \
+          | jq -r '.tag_name')
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No release tags found, falling back to master"
+            LATEST_TAG="${{ matrix.project.ref }}"
+          fi
+
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Using tag/ref: $LATEST_TAG for ${{ matrix.project.name }}"
+
       - name: Checkout ${{ matrix.project.name }}
         uses: actions/checkout@v6
         with:
           repository: ${{ matrix.project.repo }}
-          ref: ${{ matrix.project.ref }}
+          ref: ${{ steps.get_latest_release.outputs.tag }}
           path: ${{ matrix.project.name }}
 
       - name: Setup Node.js
@@ -50,7 +67,7 @@ jobs:
           while IFS= read -r plugin || [ -n "$plugin" ]; do
               # Skip empty lines and comments
               if [ -z "$plugin" ] || [[ "$plugin" =~ ^#.* ]]; then
-              continue
+               continue
               fi
               
               # Trim whitespace
@@ -58,11 +75,11 @@ jobs:
               
               echo "Installing: $plugin"
               if npm install "$plugin"; then
-              ((plugin_count++))
-              echo "✓ Successfully installed $plugin"
+               plugin_count=$((plugin_count + 1))
+               echo "✓ Successfully installed $plugin"
               else
-              echo "✗ Failed to install $plugin"
-              exit 1
+               echo "✗ Failed to install $plugin"
+               exit 1
               fi
           done < "$PLUGIN_FILE"
 
@@ -75,16 +92,16 @@ jobs:
       - name: Create archives
         run: |
           cd ${{ matrix.project.name }}
-          zip -q -r ../${{ matrix.project.name }}-${{ github.ref_name }}.zip .
-          tar -czf ../${{ matrix.project.name }}-${{ github.ref_name }}.tar.gz .
+          zip -q -r ../${{ matrix.project.name }}-${{ steps.get_latest_release.outputs.tag }}.zip .
+          tar -czf ../${{ matrix.project.name }}-${{ steps.get_latest_release.outputs.tag }}.tar.gz .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.project.name }}-build
           path: |
-            ${{ matrix.project.name }}-${{ github.ref_name }}.zip
-            ${{ matrix.project.name }}-${{ github.ref_name }}.tar.gz
+            ${{ matrix.project.name }}-${{ steps.get_latest_release.outputs.tag }}.zip
+            ${{ matrix.project.name }}-${{ steps.get_latest_release.outputs.tag }}.tar.gz
 
   create-release:
     needs: build
