@@ -1,0 +1,117 @@
+name: Build and Release (Matrix)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        project:
+          - name: wildduck
+            repo: zone-eu/wildduck
+            ref: master
+          - name: zone-mta
+            repo: zone-eu/zone-mta
+            ref: master
+          - name: haraka
+            repo: haraka/Haraka
+            ref: master
+
+    steps:
+      - name: Checkout ${{ matrix.project.name }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ matrix.project.repo }}
+          ref: ${{ matrix.project.ref }}
+          path: ${{ matrix.project.name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm i --omit=dev
+        working-directory: ${{ matrix.project.name }}
+
+      - name: Install plugins for ${{ matrix.project.name }}
+        run: |
+          PLUGIN_FILE="${GITHUB_WORKSPACE}/plugins/${{ matrix.project.name }}.txt"
+
+          if [ -f "$PLUGIN_FILE" ]; then
+          echo "📦 Installing plugins for ${{ matrix.project.name }}..."
+          plugin_count=0
+
+          while IFS= read -r plugin || [ -n "$plugin" ]; do
+              # Skip empty lines and comments
+              if [ -z "$plugin" ] || [[ "$plugin" =~ ^#.* ]]; then
+              continue
+              fi
+              
+              # Trim whitespace
+              plugin=$(echo "$plugin" | xargs)
+              
+              echo "Installing: $plugin"
+              if npm install "$plugin"; then
+              ((plugin_count++))
+              echo "✓ Successfully installed $plugin"
+              else
+              echo "✗ Failed to install $plugin"
+              exit 1
+              fi
+          done < "$PLUGIN_FILE"
+
+          echo "✅ Installed $plugin_count plugins successfully"
+          else
+          echo "❌ No plugin file found, skipping plugin installation"
+          fi
+        working-directory: ${{ matrix.project.name }}
+
+      - name: Create archives
+        run: |
+          cd ${{ matrix.project.name }}
+          zip -q -r ../${{ matrix.project.name }}-${{ github.ref_name }}.zip .
+          tar -czf ../${{ matrix.project.name }}-${{ github.ref_name }}.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.project.name }}-build
+          path: |
+            ${{ matrix.project.name }}-${{ github.ref_name }}.zip
+            ${{ matrix.project.name }}-${{ github.ref_name }}.tar.gz
+
+  create-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*/*.zip
+            artifacts/*/*.tar.gz
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## Mail Server Stack Build
+
+            This release includes:
+            - Wildduck
+            - Zone-MTA
+            - Haraka
+
+            All projects built with production-ready plugins added.

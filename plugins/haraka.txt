@@ -1,0 +1,4 @@
+haraka-plugin-redis
+haraka-plugin-rspamd
+haraka-plugin-wildduck
+haraka-plugin-headers
