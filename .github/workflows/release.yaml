@@ -6,6 +6,10 @@ on:
       - "**"
   workflow_dispatch:
     inputs:
+      release_version:
+        description: "Release version (e.g., v1.0.0 - leave empty for auto-increment)"
+        required: false
+        type: string
       wildduck_version:
         description: "Wildduck version (leave empty for latest)"
         required: false
@@ -20,7 +24,56 @@ on:
         type: string
 
 jobs:
+  determine-version:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.set_version.outputs.version }}
+    steps:
+      - name: Determine release version
+        id: set_version
+        run: |
+          if [ -n "${{ inputs.release_version }}" ]; then
+            # Use provided version
+            VERSION="${{ inputs.release_version }}"
+            
+            # Check if tag already exists
+            if git ls-remote --tags origin | grep -q "refs/tags/$VERSION"; then
+              echo "❌ Error: Tag $VERSION already exists"
+              exit 1
+            fi
+            
+            echo "Using manual version: $VERSION"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          else
+            # Get latest release and increment patch version
+            LATEST_RELEASE=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest \
+              | jq -r '.tag_name')
+            
+            if [ -z "$LATEST_RELEASE" ] || [ "$LATEST_RELEASE" = "null" ]; then
+              # No releases yet, start with v1.0.0-dispatch
+              NEW_VERSION="v1.0.0-dispatch"
+            else
+              # Remove 'v' prefix and any existing suffix
+              BASE_VERSION=$(echo "$LATEST_RELEASE" | sed 's/^v//' | sed 's/-dispatch$//')
+              
+              # Split version into components
+              IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+              
+              # Increment patch version
+              PATCH=$((PATCH + 1))
+              
+              # Create new version with -dispatch suffix
+              NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}-dispatch"
+            fi
+            
+            echo "Auto-generated version: $NEW_VERSION"
+            echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          fi
+
   build:
+    needs: [determine-version]
+    if: always() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && needs.determine-version.result == 'success'))
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -136,19 +189,42 @@ jobs:
             ${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.tar.gz
 
   create-release:
-    needs: build
+    needs: [determine-version, build]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        if: github.event_name == 'workflow_dispatch'
+
       - name: Download all artifacts
         uses: actions/download-artifact@v6
         with:
           path: artifacts
 
+      - name: Get release version
+        id: get_release_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ needs.determine-version.outputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create tag for workflow_dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.get_release_version.outputs.version }}
+          git push origin ${{ steps.get_release_version.outputs.version }}
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.get_release_version.outputs.version }}
           files: |
             artifacts/*/*.zip
             artifacts/*/*.tar.gz
@@ -157,6 +233,8 @@ jobs:
           generate_release_notes: true
           body: |
             ## Mail Server Stack Build
+
+            **Trigger:** ${{ github.event_name == 'workflow_dispatch' && 'Manual Dispatch' || 'Tag Push' }}
 
             This release includes:
             - Wildduck
