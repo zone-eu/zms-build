@@ -18,6 +18,10 @@ on:
         description: "Zone-MTA version (leave empty for latest)"
         required: false
         type: string
+      zonemta_template_version:
+        description: "Zone-MTA Template version (leave empty for latest)"
+        required: false
+        type: string
       haraka_version:
         description: "Haraka version (leave empty for latest)"
         required: false
@@ -84,6 +88,9 @@ jobs:
           - name: zone-mta
             repo: zone-eu/zone-mta
             ref: master
+          - name: zone-mta-template
+            repo: zone-eu/zone-mta-template
+            ref: master
           - name: haraka
             repo: haraka/Haraka
             ref: master
@@ -103,6 +110,9 @@ jobs:
             zone-mta)
               EXPLICIT_VERSION="${{ inputs.zonemta_version }}"
               ;;
+            zone-mta-template)
+              EXPLICIT_VERSION="${{ inputs.zonemta_template_version }}"
+              ;;
             haraka)
               EXPLICIT_VERSION="${{ inputs.haraka_version }}"
               ;;
@@ -112,12 +122,12 @@ jobs:
             echo "Using explicit version: $EXPLICIT_VERSION"
             echo "tag=$EXPLICIT_VERSION" >> $GITHUB_OUTPUT
           else
-            # Fetch latest release
-            LATEST_TAG=$(curl -s https://api.github.com/repos/${{ matrix.project.repo }}/releases/latest \
-              | jq -r '.tag_name')
+             # Fetch latest tag
+            LATEST_TAG=$(curl -s https://api.github.com/repos/${{ matrix.project.repo }}/tags \
+              | jq -r '.[0].name')
             
             if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-              echo "No release tags found, falling back to master"
+              echo "No tags found, falling back to master"
               LATEST_TAG="${{ matrix.project.ref }}"
             fi
             
@@ -239,6 +249,7 @@ jobs:
             This release includes:
             - Wildduck
             - Zone-MTA
+            - Zone-MTA Template
             - Haraka
 
             All projects built with production-ready plugins added.
