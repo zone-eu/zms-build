@@ -193,6 +193,40 @@ jobs:
           fi
         working-directory: ${{ matrix.project.name }}
 
+      - name: Generate plugin summary for release notes
+        run: |
+          PLUGIN_FILE="${GITHUB_WORKSPACE}/plugins/${{ matrix.project.name }}.txt"
+          SUMMARY_FILE="${GITHUB_WORKSPACE}/${{ matrix.project.name }}-plugins-summary.txt"
+
+          : > "$SUMMARY_FILE"
+
+          if [ -f "$PLUGIN_FILE" ]; then
+            while IFS= read -r plugin || [ -n "$plugin" ]; do
+              if [ -z "$plugin" ] || [[ "$plugin" =~ ^#.* ]]; then
+                continue
+              fi
+
+              plugin=$(echo "$plugin" | xargs)
+              version=$(
+                PLUGIN_NAME="$plugin" \
+                node -p "const pkg=require('./package.json'); const deps={...(pkg.dependencies||{}), ...(pkg.optionalDependencies||{})}; deps[process.env.PLUGIN_NAME] || ''"
+              )
+
+              if [ -z "$version" ]; then
+                version="not-installed"
+              fi
+
+              printf "%s|%s\n" "$plugin" "$version" >> "$SUMMARY_FILE"
+            done < "$PLUGIN_FILE"
+          else
+            echo "__NO_PLUGIN_FILE__|n/a" > "$SUMMARY_FILE"
+          fi
+
+          if [ ! -s "$SUMMARY_FILE" ]; then
+            echo "__NO_PLUGINS__|n/a" > "$SUMMARY_FILE"
+          fi
+        working-directory: ${{ matrix.project.name }}
+
       - name: Create archives
         run: |
           cd ${{ matrix.project.name }}
@@ -206,6 +240,7 @@ jobs:
           path: |
             ${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.zip
             ${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.tar.gz
+            ${{ matrix.project.name }}-plugins-summary.txt
 
   create-release:
     needs: [determine-version, build]
@@ -240,6 +275,55 @@ jobs:
           git tag ${{ steps.get_release_version.outputs.version }}
           git push origin ${{ steps.get_release_version.outputs.version }}
 
+      - name: Generate release body
+        env:
+          RELEASE_TRIGGER: ${{ github.event_name == 'workflow_dispatch' && 'Manual Dispatch' || 'Tag Push' }}
+        run: |
+          cat > release-body.md <<EOF
+          ## Mail Server Stack Build
+
+          **Trigger:** ${RELEASE_TRIGGER}
+          EOF
+
+          write_plugin_section() {
+            local app_name="$1"
+            local project_slug="$2"
+            local summary_file="artifacts/${project_slug}-build/${project_slug}-plugins-summary.txt"
+
+            {
+              echo ""
+              echo "### ${app_name}"
+
+              if [ ! -f "$summary_file" ]; then
+                echo "- Plugin summary not available."
+                return
+              fi
+
+              while IFS='|' read -r plugin version || [ -n "$plugin" ]; do
+                case "$plugin" in
+                  "__NO_PLUGIN_FILE__")
+                    echo "- No plugin file configured."
+                    return
+                    ;;
+                  "__NO_PLUGINS__")
+                    echo "- No plugins installed."
+                    return
+                    ;;
+                esac
+
+                echo "- \`$plugin\`: \`$version\`"
+              done < "$summary_file"
+            } >> release-body.md
+          }
+
+          write_plugin_section "Wildduck" "wildduck"
+          write_plugin_section "Zone-MTA" "zone-mta"
+          write_plugin_section "Zone-MTA Template" "zone-mta-template"
+          write_plugin_section "Haraka" "haraka"
+
+          echo "" >> release-body.md
+          echo "All projects built with production-ready plugins added." >> release-body.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -250,15 +334,4 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: false
-          body: |
-            ## Mail Server Stack Build
-
-            **Trigger:** ${{ github.event_name == 'workflow_dispatch' && 'Manual Dispatch' || 'Tag Push' }}
-
-            This release includes:
-            - Wildduck
-            - Zone-MTA
-            - Zone-MTA Template
-            - Haraka
-
-            All projects built with production-ready plugins added.
+          body_path: release-body.md
