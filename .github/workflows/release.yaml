@@ -3,11 +3,11 @@ name: Build and Release (Matrix)
 on:
   push:
     tags:
-      - "**"
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       release_version:
-        description: "Release version (e.g., v1.0.0 - leave empty for auto-increment)"
+        description: "Release version (e.g., v1.0.0 or 1.0.0 - leave empty for auto-increment)"
         required: false
         type: string
       wildduck_version:
@@ -27,63 +27,121 @@ on:
         required: false
         type: string
 
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NODE_VERSION: "24"
+
 jobs:
   determine-version:
     if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 10
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.set_version.outputs.version }}
     steps:
       - name: Determine release version
         id: set_version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION_INPUT: ${{ inputs.release_version }}
         run: |
-          if [ -n "${{ inputs.release_version }}" ]; then
-            # Use provided version
-            VERSION="${{ inputs.release_version }}"
-            
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${VERSION})
+          normalize_release_version() {
+            local version="$1"
 
-            if [ "$STATUS" = "200" ]; then
-              echo "❌ Error: Tag $VERSION already exists"
+            if [[ "$version" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+              NORMALIZED_VERSION="v${BASH_REMATCH[1]}"
+            else
+              echo "Error: release version must look like v1.2.3, 1.2.3, v1.2.3-suffix, or 1.2.3-suffix" >&2
               exit 1
             fi
-            
-            echo "Using manual version: $VERSION"
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          }
+
+          if [ -n "$RELEASE_VERSION_INPUT" ]; then
+            normalize_release_version "$RELEASE_VERSION_INPUT"
+            VERSION="$NORMALIZED_VERSION"
+
+            STATUS=$(
+              curl --silent --show-error --output /dev/null --write-out "%{http_code}" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2026-03-10" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}"
+            )
+
+            if [ "$STATUS" = "200" ]; then
+              echo "Error: tag ${VERSION} already exists" >&2
+              exit 1
+            fi
+
+            if [ "$STATUS" != "404" ]; then
+              echo "Error: failed to check tag ${VERSION}; GitHub API returned ${STATUS}" >&2
+              exit 1
+            fi
+
+            echo "Using manual version: ${VERSION}"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           else
-            # Get latest release and increment patch version
-            LATEST_RELEASE=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest \
-              | jq -r '.tag_name')
-            
-            if [ -z "$LATEST_RELEASE" ] || [ "$LATEST_RELEASE" = "null" ]; then
-              # No releases yet, start with v1.0.0-dispatch
+            LATEST_RELEASE_FILE="${RUNNER_TEMP}/latest-release.json"
+            STATUS=$(
+              curl --silent --show-error --location --output "$LATEST_RELEASE_FILE" --write-out "%{http_code}" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2026-03-10" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/latest"
+            )
+
+            if [ "$STATUS" = "200" ]; then
+              LATEST_RELEASE=$(jq -r '.tag_name // empty' "$LATEST_RELEASE_FILE")
+            elif [ "$STATUS" = "404" ]; then
+              LATEST_RELEASE=""
+            else
+              echo "Error: failed to read latest release; GitHub API returned ${STATUS}" >&2
+              exit 1
+            fi
+
+            if [ -z "$LATEST_RELEASE" ]; then
               NEW_VERSION="v1.0.0-dispatch"
             else
-              # Remove 'v' prefix and any existing suffix
-              BASE_VERSION=$(echo "$LATEST_RELEASE" | sed 's/^v//' | sed 's/-dispatch$//')
-              
-              # Split version into components
+              if [[ ! "$LATEST_RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-dispatch)?$ ]]; then
+                echo "Error: latest release ${LATEST_RELEASE} is not compatible with auto-increment" >&2
+                exit 1
+              fi
+
+              BASE_VERSION="${LATEST_RELEASE#v}"
+              BASE_VERSION="${BASE_VERSION%-dispatch}"
               IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
-              
-              # Increment patch version
               PATCH=$((PATCH + 1))
-              
-              # Create new version with -dispatch suffix
               NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}-dispatch"
             fi
-            
-            echo "Auto-generated version: $NEW_VERSION"
-            echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+            normalize_release_version "$NEW_VERSION"
+            NEW_VERSION="$NORMALIZED_VERSION"
+            echo "Auto-generated version: ${NEW_VERSION}"
+            echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
           fi
 
   build:
     needs: [determine-version]
     if: always() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && needs.determine-version.result == 'success'))
+    timeout-minutes: 45
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
     strategy:
+      fail-fast: false
       matrix:
         project:
           - name: wildduck
@@ -101,115 +159,155 @@ jobs:
 
     steps:
       - name: Checkout workflow repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Get version for ${{ matrix.project.name }}
         id: get_version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROJECT_NAME: ${{ matrix.project.name }}
+          PROJECT_REPO: ${{ matrix.project.repo }}
+          PROJECT_REF: ${{ matrix.project.ref }}
+          WILDDUCK_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.wildduck_version || '' }}
+          ZONEMTA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.zonemta_version || '' }}
+          ZONEMTA_TEMPLATE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.zonemta_template_version || '' }}
+          HARAKA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.haraka_version || '' }}
         run: |
-          # Check if explicit version is provided via workflow input
-          case "${{ matrix.project.name }}" in
+          validate_ref() {
+            local ref="$1"
+
+            if [[ ! "$ref" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "Error: refs must contain only letters, digits, dots, underscores, and hyphens: ${ref}" >&2
+              exit 1
+            fi
+          }
+
+          case "$PROJECT_NAME" in
             wildduck)
-              EXPLICIT_VERSION="${{ inputs.wildduck_version }}"
+              EXPLICIT_VERSION="$WILDDUCK_VERSION"
               ;;
             zone-mta)
-              EXPLICIT_VERSION="${{ inputs.zonemta_version }}"
+              EXPLICIT_VERSION="$ZONEMTA_VERSION"
               ;;
             zone-mta-template)
-              EXPLICIT_VERSION="${{ inputs.zonemta_template_version }}"
+              EXPLICIT_VERSION="$ZONEMTA_TEMPLATE_VERSION"
               ;;
             haraka)
-              EXPLICIT_VERSION="${{ inputs.haraka_version }}"
+              EXPLICIT_VERSION="$HARAKA_VERSION"
+              ;;
+            *)
+              echo "Error: unsupported project ${PROJECT_NAME}" >&2
+              exit 1
               ;;
           esac
 
           if [ -n "$EXPLICIT_VERSION" ]; then
-            echo "Using explicit version: $EXPLICIT_VERSION"
-            echo "tag=$EXPLICIT_VERSION" >> $GITHUB_OUTPUT
+            validate_ref "$EXPLICIT_VERSION"
+            echo "Using explicit version: ${EXPLICIT_VERSION}"
+            echo "tag=${EXPLICIT_VERSION}" >> "$GITHUB_OUTPUT"
           else
-             # Fetch latest tag
-            LATEST_TAG=$(
-              curl -s "https://api.github.com/repos/${{ matrix.project.repo }}/tags?per_page=100" |
-              jq -r '.[].name' |
-              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
-              sort -V |
-              tail -n 1
+            TAGS_JSON=$(
+              curl --fail --silent --show-error --location --retry 3 \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2026-03-10" \
+                "${GITHUB_API_URL}/repos/${PROJECT_REPO}/tags?per_page=100"
             )
-            
-            if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-              echo "No tags found, falling back to master"
-              LATEST_TAG="${{ matrix.project.ref }}"
+
+            LATEST_TAG=$(
+              jq -r '.[].name' <<< "$TAGS_JSON" |
+                awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print }' |
+                sort -V |
+                tail -n 1
+            )
+
+            if [ -z "$LATEST_TAG" ]; then
+              echo "No version tags found, falling back to ${PROJECT_REF}"
+              LATEST_TAG="$PROJECT_REF"
             fi
-            
-            echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-            echo "Using tag/ref: $LATEST_TAG for ${{ matrix.project.name }}"
+
+            validate_ref "$LATEST_TAG"
+            echo "tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+            echo "Using tag/ref: ${LATEST_TAG} for ${PROJECT_NAME}"
           fi
 
       - name: Checkout ${{ matrix.project.name }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: ${{ matrix.project.repo }}
           ref: ${{ steps.get_version.outputs.tag }}
           path: ${{ matrix.project.name }}
+          persist-credentials: false
+
+      - name: Resolve source revision
+        id: source
+        working-directory: ${{ matrix.project.name }}
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
-          node-version: "24"
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Install dependencies
-        run: npm i --omit=dev
+        run: npm install --omit=dev
         working-directory: ${{ matrix.project.name }}
 
       - name: Install plugins for ${{ matrix.project.name }}
+        env:
+          PROJECT_NAME: ${{ matrix.project.name }}
         run: |
-          PLUGIN_FILE="${GITHUB_WORKSPACE}/plugins/${{ matrix.project.name }}.txt"
+          PLUGIN_FILE="${GITHUB_WORKSPACE}/plugins/${PROJECT_NAME}.txt"
 
           if [ -f "$PLUGIN_FILE" ]; then
-          echo "📦 Installing plugins for ${{ matrix.project.name }}..."
-          plugin_count=0
+            echo "Installing plugins for ${PROJECT_NAME}..."
+            plugin_count=0
 
-          while IFS= read -r plugin || [ -n "$plugin" ]; do
-              # Skip empty lines and comments
-              if [ -z "$plugin" ] || [[ "$plugin" =~ ^#.* ]]; then
-               continue
+            while IFS= read -r plugin || [ -n "$plugin" ]; do
+              if [ -z "$plugin" ] || [[ "$plugin" =~ ^# ]]; then
+                continue
               fi
-              
-              # Trim whitespace
-              plugin=$(echo "$plugin" | xargs)
-              
-              echo "Installing: $plugin"
+
+              plugin=$(xargs <<< "$plugin")
+
+              echo "Installing: ${plugin}"
               if npm install --save-exact "$plugin"; then
-               plugin_count=$((plugin_count + 1))
-               echo "✓ Successfully installed $plugin"
+                plugin_count=$((plugin_count + 1))
+                echo "Successfully installed ${plugin}"
               else
-               echo "✗ Failed to install $plugin"
-               exit 1
+                echo "Failed to install ${plugin}" >&2
+                exit 1
               fi
-          done < "$PLUGIN_FILE"
+            done < "$PLUGIN_FILE"
 
-          echo "✅ Installed $plugin_count plugins successfully"
+            echo "Installed ${plugin_count} plugins successfully"
           else
-          echo "❌ No plugin file found, skipping plugin installation"
+            echo "No plugin file found, skipping plugin installation"
           fi
         working-directory: ${{ matrix.project.name }}
 
       - name: Generate plugin summary for release notes
+        env:
+          PROJECT_NAME: ${{ matrix.project.name }}
         run: |
-          PLUGIN_FILE="${GITHUB_WORKSPACE}/plugins/${{ matrix.project.name }}.txt"
-          SUMMARY_FILE="${GITHUB_WORKSPACE}/${{ matrix.project.name }}-plugins-summary.txt"
+          PLUGIN_FILE="${GITHUB_WORKSPACE}/plugins/${PROJECT_NAME}.txt"
+          SUMMARY_FILE="${GITHUB_WORKSPACE}/${PROJECT_NAME}-plugins-summary.txt"
 
           : > "$SUMMARY_FILE"
 
           if [ -f "$PLUGIN_FILE" ]; then
             while IFS= read -r plugin || [ -n "$plugin" ]; do
-              if [ -z "$plugin" ] || [[ "$plugin" =~ ^#.* ]]; then
+              if [ -z "$plugin" ] || [[ "$plugin" =~ ^# ]]; then
                 continue
               fi
 
-              plugin=$(echo "$plugin" | xargs)
+              plugin=$(xargs <<< "$plugin")
               version=$(
                 PLUGIN_NAME="$plugin" \
-                node -p "const pkg=require('./package.json'); const deps={...(pkg.dependencies||{}), ...(pkg.optionalDependencies||{})}; deps[process.env.PLUGIN_NAME] || ''"
+                  node -p "const pkg=require('./package.json'); const deps={...(pkg.dependencies||{}), ...(pkg.optionalDependencies||{})}; deps[process.env.PLUGIN_NAME] || ''"
               )
 
               if [ -z "$version" ]; then
@@ -227,53 +325,171 @@ jobs:
           fi
         working-directory: ${{ matrix.project.name }}
 
-      - name: Create archives
+      - name: Set artifact names
+        id: artifact_names
+        env:
+          PROJECT_NAME: ${{ matrix.project.name }}
+          PROJECT_TAG: ${{ steps.get_version.outputs.tag }}
         run: |
-          cd ${{ matrix.project.name }}
-          zip -q -r ../${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.zip . -x "*.git" "*.git/*"
-          tar --exclude='.git' --exclude='.git/*' -czf ../${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.tar.gz .
+          echo "zip=${PROJECT_NAME}-${PROJECT_TAG}.zip" >> "$GITHUB_OUTPUT"
+          echo "tar=${PROJECT_NAME}-${PROJECT_TAG}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "metadata=${PROJECT_NAME}-${PROJECT_TAG}.build-metadata.json" >> "$GITHUB_OUTPUT"
+          echo "checksums=${PROJECT_NAME}-${PROJECT_TAG}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create build metadata
+        env:
+          METADATA_NAME: ${{ steps.artifact_names.outputs.metadata }}
+          PROJECT_NAME: ${{ matrix.project.name }}
+          PROJECT_REPO: ${{ matrix.project.repo }}
+          PROJECT_REF: ${{ steps.get_version.outputs.tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          SUMMARY_FILE: ${{ github.workspace }}/${{ matrix.project.name }}-plugins-summary.txt
+        run: |
+          PLUGINS_JSON=$(
+            jq -Rn '[inputs | select(length > 0) | split("|") | {name: .[0], version: (.[1] // "")}]' \
+              < "$SUMMARY_FILE"
+          )
+
+          jq -n \
+            --arg project "$PROJECT_NAME" \
+            --arg repository "$PROJECT_REPO" \
+            --arg requested_ref "$PROJECT_REF" \
+            --arg resolved_sha "$SOURCE_SHA" \
+            --arg workflow_repository "$GITHUB_REPOSITORY" \
+            --arg workflow_ref "$GITHUB_REF" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg event_name "$GITHUB_EVENT_NAME" \
+            --argjson plugins "$PLUGINS_JSON" \
+            '{
+              project: $project,
+              source: {
+                repository: $repository,
+                requested_ref: $requested_ref,
+                resolved_sha: $resolved_sha
+              },
+              workflow: {
+                repository: $workflow_repository,
+                ref: $workflow_ref,
+                sha: $workflow_sha,
+                run_id: $run_id,
+                run_attempt: $run_attempt,
+                event_name: $event_name
+              },
+              plugins: $plugins
+            }' > "$METADATA_NAME"
+
+      - name: Create archives
+        env:
+          PROJECT_NAME: ${{ matrix.project.name }}
+          ZIP_NAME: ${{ steps.artifact_names.outputs.zip }}
+          TAR_NAME: ${{ steps.artifact_names.outputs.tar }}
+        run: |
+          cd "$PROJECT_NAME"
+          zip -q -r "../${ZIP_NAME}" . -x "*.git" "*.git/*"
+          tar --exclude='.git' --exclude='.git/*' -czf "../${TAR_NAME}" .
+
+      - name: Generate SHA-256 checksums
+        env:
+          CHECKSUMS_NAME: ${{ steps.artifact_names.outputs.checksums }}
+          METADATA_NAME: ${{ steps.artifact_names.outputs.metadata }}
+          TAR_NAME: ${{ steps.artifact_names.outputs.tar }}
+          ZIP_NAME: ${{ steps.artifact_names.outputs.zip }}
+        run: |
+          sha256sum "$ZIP_NAME" "$TAR_NAME" "$METADATA_NAME" > "$CHECKSUMS_NAME"
+          cat "$CHECKSUMS_NAME"
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-checksums: ${{ steps.artifact_names.outputs.checksums }}
+
+      - name: Attest checksum manifest
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: ${{ steps.artifact_names.outputs.checksums }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: ${{ matrix.project.name }}-build
+          if-no-files-found: error
+          retention-days: 7
           path: |
-            ${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.zip
-            ${{ matrix.project.name }}-${{ steps.get_version.outputs.tag }}.tar.gz
+            ${{ steps.artifact_names.outputs.zip }}
+            ${{ steps.artifact_names.outputs.tar }}
+            ${{ steps.artifact_names.outputs.metadata }}
+            ${{ steps.artifact_names.outputs.checksums }}
             ${{ matrix.project.name }}-plugins-summary.txt
 
   create-release:
     needs: [determine-version, build]
     if: always() && needs.build.result == 'success'
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        if: github.event_name == 'workflow_dispatch'
-
       - name: Download all artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           path: artifacts
 
+      - name: Verify artifact checksums
+        run: |
+          mapfile -d '' checksums < <(find artifacts -type f -name "*.sha256" -print0 | sort -z)
+
+          if [ "${#checksums[@]}" -eq 0 ]; then
+            echo "Error: no checksum manifests found" >&2
+            exit 1
+          fi
+
+          for checksum in "${checksums[@]}"; do
+            (
+              cd "$(dirname "$checksum")"
+              sha256sum --check "$(basename "$checksum")"
+            )
+          done
+
       - name: Get release version
         id: get_release_version
+        env:
+          DISPATCH_VERSION: ${{ needs.determine-version.outputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ needs.determine-version.outputs.version }}" >> $GITHUB_OUTPUT
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$DISPATCH_VERSION"
           else
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            VERSION="$GITHUB_REF_NAME"
           fi
+
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Error: release version must look like v1.2.3 or v1.2.3-suffix: ${VERSION}" >&2
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Create tag for workflow_dispatch
         if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.get_release_version.outputs.version }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag ${{ steps.get_release_version.outputs.version }}
-          git push origin ${{ steps.get_release_version.outputs.version }}
+          REQUEST_BODY=$(
+            jq -n \
+              --arg ref "refs/tags/${RELEASE_VERSION}" \
+              --arg sha "$GITHUB_SHA" \
+              '{ref: $ref, sha: $sha}'
+          )
+
+          curl --fail --silent --show-error --location \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --data "$REQUEST_BODY" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/refs"
 
       - name: Generate release body
         env:
@@ -285,7 +501,7 @@ jobs:
           **Trigger:** ${RELEASE_TRIGGER}
           EOF
 
-          write_plugin_section() {
+          write_project_section() {
             local app_name="$1"
             local project_slug="$2"
             local summary_file="artifacts/${project_slug}-build/${project_slug}-plugins-summary.txt"
@@ -293,7 +509,28 @@ jobs:
             {
               echo ""
               echo "### ${app_name}"
+            } >> release-body.md
 
+            shopt -s nullglob
+            local metadata_files=(artifacts/${project_slug}-build/${project_slug}-*.build-metadata.json)
+            shopt -u nullglob
+
+            if [ "${#metadata_files[@]}" -gt 0 ]; then
+              local metadata_file="${metadata_files[0]}"
+              local source_repo source_ref source_sha source_sha_short
+
+              source_repo=$(jq -r '.source.repository' "$metadata_file")
+              source_ref=$(jq -r '.source.requested_ref' "$metadata_file")
+              source_sha=$(jq -r '.source.resolved_sha' "$metadata_file")
+              source_sha_short="${source_sha:0:12}"
+
+              {
+                echo "- Source: \`${source_repo}@${source_ref}\` (\`${source_sha_short}\`)"
+                echo ""
+              } >> release-body.md
+            fi
+
+            {
               if [ ! -f "$summary_file" ]; then
                 echo "- Plugin summary not available."
                 return
@@ -316,22 +553,26 @@ jobs:
             } >> release-body.md
           }
 
-          write_plugin_section "Wildduck" "wildduck"
-          write_plugin_section "Zone-MTA" "zone-mta"
-          write_plugin_section "Zone-MTA Template" "zone-mta-template"
-          write_plugin_section "Haraka" "haraka"
+          write_project_section "Wildduck" "wildduck"
+          write_project_section "Zone-MTA" "zone-mta"
+          write_project_section "Zone-MTA Template" "zone-mta-template"
+          write_project_section "Haraka" "haraka"
 
           echo "" >> release-body.md
           echo "All projects built with production-ready plugins added." >> release-body.md
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2
         with:
           tag_name: ${{ steps.get_release_version.outputs.version }}
           files: |
             artifacts/*/*.zip
             artifacts/*/*.tar.gz
+            artifacts/*/*.sha256
+            artifacts/*/*.build-metadata.json
           draft: false
           prerelease: false
           generate_release_notes: false
           body_path: release-body.md
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
