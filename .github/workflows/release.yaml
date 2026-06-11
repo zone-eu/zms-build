@@ -113,7 +113,7 @@ jobs:
             if [ -z "$LATEST_RELEASE" ]; then
               NEW_VERSION="v1.0.0-dispatch"
             else
-              if [[ ! "$LATEST_RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-dispatch)?$ ]]; then
+              if [[ ! "$LATEST_RELEASE" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-dispatch)?$ ]]; then
                 echo "Error: latest release ${LATEST_RELEASE} is not compatible with auto-increment" >&2
                 exit 1
               fi
