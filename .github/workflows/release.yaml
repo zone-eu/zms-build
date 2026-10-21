@@ -14,6 +14,14 @@ on:
         description: "Wildduck version (leave empty for latest)"
         required: false
         type: string
+      zonemta_wildduck_version:
+        description: "ZoneMTA Wildduck plugin version (e.g., 1.33.6 - leave empty for latest)"
+        required: false
+        type: string
+      haraka_plugin_wildduck_version:
+        description: "Haraka Wildduck plugin version (e.g., 6.1.4 - leave empty for latest)"
+        required: false
+        type: string
       zonemta_version:
         description: "Zone-MTA version (leave empty for latest)"
         required: false
@@ -259,6 +267,8 @@ jobs:
       - name: Install plugins for ${{ matrix.project.name }}
         env:
           PROJECT_NAME: ${{ matrix.project.name }}
+          ZONEMTA_WILDDUCK_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.zonemta_wildduck_version || '' }}
+          HARAKA_PLUGIN_WILDDUCK_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.haraka_plugin_wildduck_version || '' }}
         run: |
           PLUGIN_FILE="${GITHUB_WORKSPACE}/plugins/${PROJECT_NAME}.txt"
 
@@ -273,12 +283,32 @@ jobs:
 
               plugin=$(xargs <<< "$plugin")
 
-              echo "Installing: ${plugin}"
-              if npm install --save-exact "$plugin"; then
+              explicit_version=""
+              case "$plugin" in
+                @zone-eu/zonemta-wildduck)
+                  explicit_version="$ZONEMTA_WILDDUCK_VERSION"
+                  ;;
+                haraka-plugin-wildduck)
+                  explicit_version="$HARAKA_PLUGIN_WILDDUCK_VERSION"
+                  ;;
+              esac
+
+              plugin_spec="$plugin"
+              if [ -n "$explicit_version" ]; then
+                if [[ ! "$explicit_version" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+                  echo "Error: invalid version for ${plugin}: ${explicit_version}" >&2
+                  exit 1
+                fi
+
+                plugin_spec="${plugin}@${BASH_REMATCH[1]}"
+              fi
+
+              echo "Installing: ${plugin_spec}"
+              if npm install --save-exact "$plugin_spec"; then
                 plugin_count=$((plugin_count + 1))
-                echo "Successfully installed ${plugin}"
+                echo "Successfully installed ${plugin_spec}"
               else
-                echo "Failed to install ${plugin}" >&2
+                echo "Failed to install ${plugin_spec}" >&2
                 exit 1
               fi
             done < "$PLUGIN_FILE"
